@@ -1,6 +1,6 @@
 #!/bin/sh
 # Copyright 2011, 2012, 2013, 2014, 2015, 2016, 2017 Max H. Parke KA1RBI
-# Copyright 2020, 2021 Graham J. Norbury - gnorbury@bondcar.com
+# Copyright 2020, 2023 Graham J. Norbury - gnorbury@bondcar.com
 # 
 # This file is part of OP25
 # 
@@ -59,7 +59,7 @@ from optparse import OptionParser
 
 import op25
 import op25_repeater
-import p25_demodulator
+import p25_demodulator_dev as p25_demodulator
 import op25_nbfm
 import op25_iqsrc
 import op25_wavsrc
@@ -117,6 +117,15 @@ class device(object):
             self.fractional_corr = 0
             self.tunable = False
 
+        elif config['args'] == 'symbols':
+            self.src = None
+            self.sample_rate = config['rate']
+            self.frequency = int(from_dict(config, 'frequency', 800000000))
+            self.usable_bw = float(from_dict(config, 'usable_bw_pct', 1.0))
+            self.offset = int(from_dict(config, 'offset', 0))
+            self.ppm = float(from_dict(config, 'ppm', "0.0"))
+            self.fractional_corr = int((int(round(self.ppm)) - self.ppm) * (self.frequency/1e6))
+
         else:
             if config['args'].startswith('rtl') and config['rate'] not in speeds:
                 sys.stderr.write('WARNING: requested sample rate %d for device %s may not\n' % (config['rate'], config['name']))
@@ -142,7 +151,8 @@ class device(object):
             self.src.set_freq_corr(int(round(self.ppm)))
 
             self.src.set_sample_rate(config['rate'])
-            self.sample_rate = config['rate']
+            #self.sample_rate = config['rate']
+            self.sample_rate = self.src.get_sample_rate() # actual rate may not be the same as the requested rate!
 
             self.offset = int(from_dict(config, 'offset', 0))
 
@@ -208,7 +218,7 @@ class channel(object):
                              filter_type = filter_type,
                              usable_bw = self.device.usable_bw,
                              excess_bw = float(from_dict(config, 'excess_bw', 0.2)),
-                             relative_freq = (dev.frequency + dev.offset + dev.fractional_corr),
+                             relative_freq = ((dev.frequency + dev.offset + dev.fractional_corr) - self.frequency),
                              offset = dev.offset,
                              if_rate = config['if_rate'],
                              symbol_rate = self.symbol_rate)
@@ -221,7 +231,7 @@ class channel(object):
                              filter_type = config['filter_type'],
                              usable_bw = self.device.usable_bw,
                              excess_bw = float(from_dict(config, 'excess_bw', 0.2)),
-                             relative_freq = (dev.frequency + dev.offset + dev.fractional_corr),
+                             relative_freq = ((dev.frequency + dev.offset + dev.fractional_corr) - self.frequency),
                              offset = dev.offset,
                              if_rate = config['if_rate'],
                              symbol_rate = self.symbol_rate)
@@ -232,7 +242,7 @@ class channel(object):
             sys.stderr.write("%s [%d] reading channel crypt_keys file: %s\n" % (log_ts.get(), self.msgq_id, self.crypt_keys_file))
             self.crypt_keys = get_key_dict(self.crypt_keys_file, self.msgq_id)
             for keyid in self.crypt_keys.keys():
-                self.decoder.crypt_key(int(keyid), int(self.crypt_keys[keyid]['algid']), self.crypt_keys[keyid]['key'])
+                self.decoder.control(json.dumps({'tuner': self.msgq_id, 'cmd': 'crypt_key', 'keyid': int(keyid), 'algid': int(self.crypt_keys[keyid]['algid']), 'key': self.crypt_keys[keyid]['key']}))
 
         # Relative-tune the demodulator
         if not self.demod.set_relative_frequency((dev.frequency + dev.offset + dev.fractional_corr) - self.frequency):
@@ -444,7 +454,8 @@ class channel(object):
         if not self.demod.set_relative_frequency(self.device.offset + self.device.frequency + self.device.fractional_corr + self.tracking - freq): # First attempt relative tune
             if self.device.tunable:                                                                  # then hard tune if allowed
                 self.device.frequency = self.frequency
-                self.device.src.set_center_freq(self.frequency + self.device.offset)
+                if self.device.src is not None:
+                    self.device.src.set_center_freq(self.frequency + self.device.offset)
                 self.device.fractional_corr = int((int(round(self.device.ppm)) - self.device.ppm) * (self.device.frequency/1e6))        # Calc frac ppm using new freq
                 self.demod.set_relative_frequency(self.device.offset + self.device.frequency + self.device.fractional_corr + self.tracking - freq)
                 if self.verbosity >= 9:
@@ -465,14 +476,15 @@ class channel(object):
         if self.verbosity >= 9:
             sys.stderr.write("%s [%d] Tuning to frequency %f\n" % (log_ts.get(), self.msgq_id, (freq/1e6)))
         self.demod.reset()          # reset gardner-costas tracking loop
-        self.decoder.sync_reset()   # reset frame_assembler
+        self.decoder.control(json.dumps({'tuner': self.msgq_id, 'cmd': 'sync_reset'}))
         return True
 
     def adj_tune(self, adjustment): # ideally this would all be done at the device level but the demod belongs to the channel object
         self.tracking = 0
         self.device.ppm -= get_fractional_ppm(self.device.frequency, adjustment)
-        self.device.src.set_freq_corr(int(round(self.device.ppm)))
-        self.device.src.set_center_freq(self.device.frequency + self.device.offset)
+        if self.device.src is not None:
+            self.device.src.set_freq_corr(int(round(self.device.ppm)))
+            self.device.src.set_center_freq(self.device.frequency + self.device.offset)
         self.device.fractional_corr = int((int(round(self.device.ppm)) - self.device.ppm) * (self.device.frequency/1e6))
         self.demod.set_relative_frequency(self.device.offset + self.device.frequency + self.device.fractional_corr + self.tracking - self.frequency)
         self.demod.reset()          # reset gardner-costas tracking loop
@@ -481,7 +493,7 @@ class channel(object):
         set_tdma = False
         if 'tdma' in params and params['tdma'] is not None:
             set_tdma = True
-            self.decoder.set_slotid(params['tdma'])
+            self.decoder.control(json.dumps({'tuner': self.msgq_id, 'cmd': 'set_slotid', 'slotid': params['tdma']}))
         if set_tdma == self.tdma_state:
             return
         self.tdma_state = set_tdma
@@ -491,7 +503,7 @@ class channel(object):
                 self.xor_cache[hash] = lfsr.p25p2_lfsr(params['nac'], params['sysid'], params['wacn']).xor_chars
                 if self.verbosity >= 5:
                     sys.stderr.write("%s [%d] Caching TDMA xor mask for NAC: 0x%x, SYSID: 0x%x, WACN: 0x%x\n" % (log_ts.get(), self.msgq_id, params['nac'], params['sysid'], params['wacn'])) 
-            self.decoder.set_xormask(self.xor_cache[hash])
+            self.decoder.control(json.dumps({'tuner': self.msgq_id, 'cmd': 'set_xormask', 'xormask': self.xor_cache[hash]}))
             rate = 6000
         else:
             rate = self.channel_rate
@@ -507,15 +519,10 @@ class channel(object):
         if 'eye' in self.sinks:
             self.sinks['eye'][0].set_sps(self.config['if_rate'] / rate)
 
-    def set_nac(self, nac):
-        self.decoder.set_nac(nac)
-
-    def set_slot(self, slot):
-        self.chan_idle = True if (slot == 4) else False
-        self.decoder.set_slotid(slot)
-
-    def set_key(self, key):
-        self.decoder.set_slotkey(key)
+    def control(self, params):
+        if 'cmd' in params and params['cmd'] == "set_slotid":
+            self.chan_idle = True if (params['slotid'] == 4) else False
+        self.decoder.control(json.dumps(params))
 
     def kill(self):
         for sink in self.sinks:
@@ -684,7 +691,7 @@ class rx_block (gr.top_block):
             self.trunking = None
 
         if self.trunking is not None:
-            self.trunk_rx = self.trunking.rx_ctl(frequency_set = self.change_freq, nac_set = self.set_nac, slot_set = self.set_slot, nbfm_ctrl = self.nbfm_control, debug = self.verbosity, chans = config['chans'])
+            self.trunk_rx = self.trunking.rx_ctl(frequency_set = self.change_freq, nbfm_ctrl = self.nbfm_control, fa_ctrl = self.fa_control, debug = self.verbosity, chans = config['chans'])
             self.du_watcher = du_queue_watcher(self.rx_q, self.trunk_rx.process_qmsg)
             sys.stderr.write("Enabled trunking module: %s\n" % config['module'])
 
@@ -776,7 +783,7 @@ class rx_block (gr.top_block):
                 if ("raw_seek" in cfg) and (cfg['raw_seek'] != 0):
                     chan.raw_file.seek(int(cfg['raw_seek']) * 4800, 0)
                 chan.throttle = blocks.throttle(gr.sizeof_char, chan.symbol_rate)
-                chan.throttle.set_max_noutput_items(chan.symbol_rate/50);
+                chan.throttle.set_max_noutput_items(int(chan.symbol_rate/50));
                 self.connect(chan.raw_file, chan.throttle)
                 self.connect(chan.throttle, chan.decoder)
                 self.set_interactive(False) # this is non-interactive 'replay' session 
@@ -803,11 +810,11 @@ class rx_block (gr.top_block):
             chan.configure_p25_tdma(params)
 
         if not chan.set_freq(params['freq']):
-            chan.set_slot(0)
+            chan.control({'tuner': chan.msgq_id, 'cmd': 'set_slotid', 'slotid': 0})
             return False
 
         if 'slot' in params:
-            chan.set_slot(params['slot'])
+            chan.control({'tuner': chan.msgq_id, 'cmd': 'set_slotid', 'slotid': params['slot']})
 
         if 'rate' in params:
             chan.set_rate(params['rate'])
@@ -826,17 +833,11 @@ class rx_block (gr.top_block):
 
         return True
 
-    def set_nac(self, params):
+    def fa_control(self, params):
         tuner = params['tuner']
         chan = self.channels[tuner]
-        if 'nac' in params:
-            chan.set_nac(params['nac'])
-
-    def set_slot(self, params):
-        tuner = params['tuner']
-        chan = self.channels[tuner]
-        if 'slot' in params:
-            chan.set_slot(params['slot'])
+        if chan is not None:
+            chan.control(params)
 
     def nbfm_control(self, msgq_id, action):
         if (msgq_id >= 0 and msgq_id < len(self.channels)) and self.channels[msgq_id].nbfm is not None:
@@ -852,14 +853,15 @@ class rx_block (gr.top_block):
             s = s.decode()
         if s == 'quit':
             return True
-        elif s == 'update':                 # UI initiated update request
+        elif s == 'update':                     # UI initiated update request
             self.ui_last_update = time.time()
             self.ui_freq_update()
             if self.trunking is None or self.trunk_rx is None:
                 return False
-            js = self.trunk_rx.to_json()    # extract data from trunking module
+            js = self.trunk_rx.to_json()        # extract data from trunking module
             msg = gr.message().make_from_string(js, -4, 0, 0)
-            self.ui_in_q.insert_tail(msg)   # send info back to UI
+            if not self.ui_in_q.full_p():
+                self.ui_in_q.insert_tail(msg)   # send info back to UI as long asa queue not full
             self.ui_plot_update()
         elif s == 'toggle_plot':
             if not self.get_interactive():
@@ -880,7 +882,8 @@ class rx_block (gr.top_block):
                 self.terminal_config['json_type'] = "terminal_config"
                 js = json.dumps(self.terminal_config)
                 msg = gr.message().make_from_string(js, -4, 0, 0)
-                self.ui_in_q.insert_tail(msg)
+                if not self.ui_in_q.full_p():
+                    self.ui_in_q.insert_tail(msg)
             else:
                 return False
         elif s == 'get_full_config':
@@ -888,7 +891,8 @@ class rx_block (gr.top_block):
             cfg['json_type'] = "full_config"
             js = json.dumps(cfg)
             msg = gr.message().make_from_string(js, -4, 0, 0)
-            self.ui_in_q.insert_tail(msg)
+            if not self.ui_in_q.full_p():
+                self.ui_in_q.insert_tail(msg)
         elif s == 'set_full_config':
             pass
         elif s == 'dump_tgids':
@@ -938,7 +942,8 @@ class rx_block (gr.top_block):
             params[rx_id]['stream_url'] = meta_s.get_url()
         js = json.dumps(params)
         msg = gr.message().make_from_string(js, -4, 0, 0)
-        self.ui_in_q.insert_tail(msg)
+        if not self.ui_in_q.full_p():
+            self.ui_in_q.insert_tail(msg)
 
     def ui_plot_update(self):
         if self.terminal_type is None or self.terminal_type != "http":
@@ -951,7 +956,8 @@ class rx_block (gr.top_block):
                     filenames.append(chan.sinks[sink][0].gnuplot.filename)
         d = {'json_type': 'rx_update', 'files': filenames}
         msg = gr.message().make_from_string(json.dumps(d), -4, 0, 0)
-        self.ui_in_q.insert_tail(msg)
+        if not self.ui_in_q.full_p():
+            self.ui_in_q.insert_tail(msg)
 
     def kill(self):
         for chan in self.channels:
@@ -978,7 +984,7 @@ class du_queue_watcher(threading.Thread):
 
     def __init__(self, msgq,  callback, **kwds):
         threading.Thread.__init__ (self, **kwds)
-        self.setDaemon(1)
+        self.daemon = True
         self.msgq = msgq
         self.callback = callback
         self.keep_running = True
@@ -987,11 +993,14 @@ class du_queue_watcher(threading.Thread):
     def run(self):
         try:
             while(self.keep_running):
-                msg = self.msgq.delete_head()
-                if msg is not None:
-                    self.callback(msg)
-                else:
-                    self.keep_running = False
+                if not self.msgq.empty_p(): # check queue before trying to read a message to avoid deadlock at startup
+                    msg = self.msgq.delete_head()
+                    if msg is not None:
+                        self.callback(msg)
+                    else:
+                        self.keep_running = False
+                else: # empty queue
+                    time.sleep(0.01)
         except KeyboardInterrupt:
             self.keep_running = False
 
@@ -1020,9 +1029,16 @@ class rx_main(object):
         parser.add_option("-c", "--config-file", type="string", default=None, help="specify config file name")
         parser.add_option("-v", "--verbosity", type="int", default=0, help="message debug level")
         parser.add_option("-p", "--pause", action="store_true", default=False, help="block on startup")
+        parser.add_option("-d", "--dev-mode", action="store_true", default=False, help="enable developer mode")
         (options, args) = parser.parse_args()
 
+        #if options.dev_mode:
+        #    globals()["p25_demodulator"] = importlib.import_module("p25_demodulator_dev")
+        #else:
+        #    globals()["p25_demodulator"] = importlib.import_module("p25_demodulator")
+
         # wait for gdb
+        sys.stderr.write("Starting OP25 (pid = %d)\n" % (os.getpid()))
         if options.pause:
             sys.stdout.write("Ready for GDB to attach (pid = %d)\n" % (os.getpid(),))
             if sys.version[0] > '2':
@@ -1053,7 +1069,8 @@ class rx_main(object):
                 while self.keep_running:
                     time.sleep(1.0)
                     msg = gr.message().make_from_string("watchdog", -2, 0, 0)
-                    self.tb.ui_out_q.insert_tail(msg)
+                    if not self.tb.ui_out_q.full_p():
+                       self.tb.ui_out_q.insert_tail(msg)
             else:
                 self.tb.wait() # curiously wait() matures when a flowgraph gets locked
             sys.stderr.write('Flowgraph complete. Exiting\n')
